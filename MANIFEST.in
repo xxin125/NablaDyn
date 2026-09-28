@@ -1,0 +1,2 @@
+recursive-include src/nabladyn/neighbors/csrc *.h *.cuh *.cpp *.cu
+include LICENSE README.md
