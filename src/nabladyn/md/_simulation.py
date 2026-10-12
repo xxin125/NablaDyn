@@ -40,6 +40,23 @@ def _count(name: str, value: Integral) -> int:
     return int(value)
 
 
+def _capture_graph(program, *args) -> torch.cuda.CUDAGraph:
+    """Capture ``program(*args)`` in a CUDA Graph that owns its cuBLAS workspace.
+
+    Every capture runs on torch's one capture stream, and cuBLAS keeps one workspace per
+    stream. Allocated during the first capture, it lives in that graph's private memory and
+    is freed with that graph, while later graphs that reused it would go on reading and
+    writing it: an illegal memory access once the memory is released. Clearing the
+    workspaces before and after each capture gives every graph its own. Syncs with the host.
+    """
+    torch._C._cuda_clearCublasWorkspaces()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        program(*args)
+    torch._C._cuda_clearCublasWorkspaces()
+    return graph
+
+
 def _check_model(model: Potential) -> None:
     """Raise ``TypeError`` unless the model is a ``Potential``."""
     if not isinstance(model, Potential):
@@ -109,11 +126,12 @@ def _check_sampling(sample_every: Integral | None, echo, sample_file) -> None:
 class Simulation:
     """Molecular dynamics of a potential on the GPU; build it with ``nve``, ``nvt`` or ``npt``.
 
-    It owns its frame, a neighbor list at the model's cutoff and a CUDA Graph of one step,
-    which ``run`` replays. A second graph, captured on first use, evaluates the panel of
-    ``FIELDS``: potential, kinetic and total energy in kJ/mol, the temperature over 3N - 3
-    degrees of freedom in K, and the pressure in kJ/mol/nm^3. The step reads the model's
-    parameter storage, so a parameter changed in place reaches the next step.
+    It owns its frame, a neighbor list at the model's cutoff, with an inner list at each
+    smaller cutoff the model reads, and a CUDA Graph of one step, which ``run`` replays. A
+    second graph, captured on first use, evaluates the panel of ``FIELDS``: potential,
+    kinetic and total energy in kJ/mol, the temperature over $`3N - 3`$ degrees of freedom in
+    K, and the pressure in kJ/mol/nm^3. The step reads the model's parameter storage, so a
+    parameter changed in place reaches the next step.
     """
 
     def __init__(
@@ -147,6 +165,7 @@ class Simulation:
             model.cutoff,
             skin=skin,
             capacity_multiplier=capacity_multiplier,
+            inner_cutoffs=model._list_cutoffs[:-1],
         )
         self._neighbors.allocate(positions, cell)  # checks the positions and the cell
         cell = cell.detach().clone()
@@ -339,9 +358,7 @@ class Simulation:
                     step()
             current.wait_stream(stream)
             self._check(self._step + 3)  # catches a first frame that fails in the warm-up
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                step()
+            graph = _capture_graph(step)
         for tensor, saved in zip(resident, entry):
             tensor.copy_(saved)
         return programs, graph
@@ -380,9 +397,7 @@ class Simulation:
                 for _ in range(2):
                     program(frame, pairs, row)
             current.wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                program(frame, pairs, row)
+            graph = _capture_graph(program, frame, pairs, row)
         self._sampler = (program, graph, row)
         return self._sampler
 

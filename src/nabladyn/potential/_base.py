@@ -24,12 +24,18 @@ def _check_tensor(
 
 
 def _check_pairs(pairs: NeighborPairs, num_atoms: int, cutoff: float, device: torch.device) -> None:
-    """Raise ``ValueError`` unless the pairs fit these atoms and device and reach the cutoff."""
-    index = pairs.index
-    if index.ndim != 2 or index.shape[0] != 2 or index.device != device:
-        raise ValueError(f"pairs.index must be a [2, C] tensor on {device}")
-    if pairs.num_atoms != num_atoms:
-        raise ValueError(f"the pairs are for {pairs.num_atoms} atoms, the model for {num_atoms}")
+    """Raise ``ValueError`` unless the pairs and their inner lists fit these atoms and device.
+
+    The list must reach the cutoff.
+    """
+    for listed in (pairs, *pairs.inner):
+        index = listed.index
+        if index.ndim != 2 or index.shape[0] != 2 or index.device != device:
+            raise ValueError(f"pairs.index must be a [2, C] tensor on {device}")
+        if listed.num_atoms != num_atoms:
+            raise ValueError(
+                f"the pairs are for {listed.num_atoms} atoms, the model for {num_atoms}",
+            )
     # A list is complete only within its own cutoff; beyond it, pairs drop out as atoms move.
     if pairs.cutoff < cutoff:
         raise ValueError(
@@ -64,6 +70,14 @@ class Potential(nn.Module, ABC):
     @abstractmethod
     def device(self) -> torch.device:
         """The device the model computes on."""
+
+    @property
+    def _list_cutoffs(self) -> tuple[float, ...]:
+        """The cutoffs in nm of the neighbor lists the model reads, ascending; the last is its own.
+
+        MD and fit build a list at each; a sum reads one per cutoff of its models.
+        """
+        return (self.cutoff,)
 
     def forward(
         self,

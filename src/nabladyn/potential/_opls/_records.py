@@ -34,7 +34,7 @@ class Topology:
 
 @dataclass(frozen=True, kw_only=True, eq=False)
 class Parameters:
-    """The force field's parameter tables, one row per type of the ``Topology``.
+    r"""The force field's parameter tables, one row per type of the ``Topology``.
 
     Vectors of one float dtype, float32 or float64, on one device, except
     ``dihedral_periodicity``, int64 on that device:
@@ -42,10 +42,11 @@ class Parameters:
     - ``charge`` [Tq] in e;
     - ``sigma`` [Tlj] in nm and ``epsilon`` [Tlj] in kJ/mol, both >= 0, mixed geometrically
       for each pair; a type with epsilon 0 has no Lennard-Jones term;
-    - ``bond_r0`` [Tb] in nm and ``bond_k`` [Tb] in kJ/mol/nm^2: 0.5 k (r - r0)^2;
-    - ``angle_theta0`` [Ta] in rad and ``angle_k`` [Ta] in kJ/mol/rad^2: 0.5 k (theta - theta0)^2;
-    - ``dihedral_k`` [Td] in kJ/mol, ``dihedral_periodicity`` [Td], n >= 1, and
-      ``dihedral_phase`` [Td] in rad: k [1 + cos(n phi - phase)].
+    - ``bond_r0`` [Tb] in nm and ``bond_k`` [Tb] in kJ/mol/nm^2: $`0.5 k (r - r_0)^2`$;
+    - ``angle_theta0`` [Ta] in rad and ``angle_k`` [Ta] in kJ/mol/rad^2:
+      $`0.5 k (\theta - \theta_0)^2`$;
+    - ``dihedral_k`` [Td] in kJ/mol, ``dihedral_periodicity`` [Td], $`n \ge 1`$, and
+      ``dihedral_phase`` [Td] in rad: $`k [1 + \cos(n\phi - \mathrm{phase})]`$.
     """
 
     charge: Tensor

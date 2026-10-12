@@ -72,6 +72,17 @@ def _check_settings(cutoff: Real, skin: Real, capacity_multiplier: Real) -> None
         )
 
 
+def _check_inner_cutoffs(inner_cutoffs: tuple[Real, ...], cutoff: Real) -> None:
+    """Raise ``ValueError`` unless the inner cutoffs are distinct numbers between 0 and cutoff."""
+    if not isinstance(inner_cutoffs, (tuple, list)):
+        raise ValueError("inner_cutoffs must be a tuple of cutoffs in nm")
+    for value in inner_cutoffs:
+        if isinstance(value, bool) or not isinstance(value, Real) or not 0 < value < cutoff:
+            raise ValueError("every inner cutoff must be a number between 0 and the cutoff")
+    if len(set(inner_cutoffs)) != len(inner_cutoffs):
+        raise ValueError("the inner cutoffs must be distinct")
+
+
 def _check_frame(positions: Tensor, cell: Tensor) -> None:
     """Raise ``TypeError`` or ``ValueError`` unless positions [N, 3] and cell [3] fit a list."""
     for name, value in (("positions", positions), ("cell", cell)):
@@ -156,15 +167,33 @@ class NeighborList:
     within the cutoff could be missing, then rebuilds. ``tensors()`` returns the pairs. Cells
     are orthorhombic and periodic; positions may lie outside the cell.
 
+    For each of ``inner_cutoffs``, smaller cutoffs in nm, the list also keeps an inner list:
+    the pairs within that cutoff + skin, with the same skin and capacity rule, allocated,
+    updated and checked with this one. ``tensors()`` returns them in ``NeighborPairs.inner``;
+    a sum of models gives each model the list at its own cutoff.
+
     Raises ``ValueError`` unless ``cutoff`` is positive, ``skin`` nonnegative and
-    ``capacity_multiplier`` at least 1, all finite.
+    ``capacity_multiplier`` at least 1, all finite, and the inner cutoffs distinct numbers
+    between 0 and ``cutoff``.
     """
 
-    def __init__(self, cutoff: Real, *, skin: Real = 0.0, capacity_multiplier: Real = 1.25):
+    def __init__(
+        self,
+        cutoff: Real,
+        *,
+        skin: Real = 0.0,
+        capacity_multiplier: Real = 1.25,
+        inner_cutoffs: tuple[Real, ...] = (),
+    ):
         _check_settings(cutoff, skin, capacity_multiplier)
+        _check_inner_cutoffs(inner_cutoffs, cutoff)
         self._cutoff = float(cutoff)
         self._skin = float(skin)
         self._capacity_multiplier = float(capacity_multiplier)
+        self._inner = tuple(
+            NeighborList(value, skin=skin, capacity_multiplier=capacity_multiplier)
+            for value in sorted(inner_cutoffs)
+        )
         self._buffers: _Buffers | None = None
         self._reuse: _Reuse | None = None
         self._failure: str | None = None
@@ -182,8 +211,9 @@ class NeighborList:
     def allocate(self, positions: Tensor, cell: Tensor) -> None:
         """Count the pairs of positions [N, 3] in the cell [3], size the list and build it.
 
-        Positions and cell are CUDA float32 or float64 tensors in nm. It also recovers a
-        list that failed an update. Syncs with the host.
+        Positions and cell are CUDA float32 or float64 tensors in nm. The inner lists are
+        allocated after the list; one that cannot be leaves the list failed until ``allocate``
+        succeeds. It also recovers a list that failed an update. Syncs with the host.
 
         Raises ``TypeError`` or ``ValueError`` for invalid positions or cell, and
         ``ValueError`` when the grid or the pairs do not fit int32.
@@ -240,21 +270,28 @@ class NeighborList:
             rebuild=torch.zeros(1, **integers),
             rebuild_count=torch.ones(1, **integers),
         )
-        self._buffers, self._failure = buffers, None
+        self._buffers = buffers
+        # Failed until every inner list is built: it must never return its new pairs with an
+        # inner list's old ones.
+        self._failure = "an inner list was not allocated"
+        for inner in self._inner:
+            inner.allocate(positions, cell)
+        self._failure = None
 
     def update(self, positions: Tensor, cell: Tensor) -> None:
-        """Reuse the pairs for positions [N, 3] in the cell [3], or rebuild them.
+        r"""Reuse the pairs for positions [N, 3] in the cell [3], or rebuild them.
 
-        The pairs are reused while no atom has moved more than (R s_min - cutoff) / 2 from its
-        position at the last rebuild, scaled with the cell; R is the list radius and s_min the
-        smallest ratio of a cell length to its length then. In a fixed cell that is half the
-        skin, so zero skin rebuilds every time. Syncs with the host.
+        The pairs are reused while no atom has moved more than $`(R s_{\min} - r_c) / 2`$ from
+        its position at the last rebuild, scaled with the cell; R is the list radius,
+        $`r_c`$ the cutoff and $`s_{\min}`$ the smallest ratio of a cell length to its length
+        then. In a fixed cell that is half the skin, so zero skin rebuilds every time. Each
+        inner list follows the same rule. Syncs with the host.
 
         Raises ``TypeError`` or ``ValueError`` for positions or a cell of the wrong kind or
         unlike the allocated ones. Raises ``ValueError``, and fails the list until
         ``allocate``, for a cell length not finite or not above twice the cutoff, a coordinate
-        that is not finite, or more pairs than the capacity. Raises ``RuntimeError`` before
-        ``allocate`` or after a failure.
+        that is not finite, or more pairs than the capacity of the list or an inner list.
+        Raises ``RuntimeError`` before ``allocate`` or after a failure.
         """
         buffers = self._live_buffers()
         _check_frame(positions, cell)
@@ -264,7 +301,7 @@ class NeighborList:
         self._check_status()
 
     def _update_wrapped(self, positions: Tensor, cell: Tensor) -> None:
-        """Reuse or rebuild the pairs for contiguous positions already in [0, L).
+        """Reuse or rebuild the pairs, and the inner lists', for contiguous positions in [0, L).
 
         Runs no checks, so a CUDA Graph can capture it; read the status later with
         ``_check_status``. No host sync.
@@ -283,53 +320,64 @@ class NeighborList:
             reuse.rebuild_count,
             *self._buffers.args(),
         )
+        for inner in self._inner:
+            inner._update_wrapped(positions, cell)
 
     def _rebuild_wrapped(self, positions: Tensor, cell: Tensor) -> None:
         """Rebuild the pairs for contiguous positions already in [0, L), whatever the reuse rule.
 
-        An infinite reference cell forces the rebuild, which stores this frame as the reference.
-        Runs no checks; read the status later with ``_check_status``. No host sync.
+        An infinite reference cell forces the rebuild, which stores this frame as the reference;
+        the inner lists rebuild too. Runs no checks; read the status later with
+        ``_check_status``. No host sync.
         """
-        self._reuse.reference_cell.fill_(math.inf)
+        for listed in (self, *self._inner):
+            listed._reuse.reference_cell.fill_(math.inf)
         self._update_wrapped(positions, cell)
 
     def _check_status(self) -> None:
-        """Raise ``ValueError`` and fail the list if an update reported an error.
+        """Raise ``ValueError`` and fail the list if an update of it or an inner list failed.
 
         Syncs with the host.
         """
         flags, needed = self._live_buffers().status.tolist()
-        if not flags:
-            return
-        causes = []
-        if flags & _INVALID_CELL:
-            causes.append("every cell length must be finite and above twice the cutoff")
-        if flags & _NON_FINITE:
-            causes.append("positions must be finite")
-        if flags & _OVERFLOW:
-            causes.append(
-                f"the pair capacity {self.pair_capacity} is too small: the frame has "
-                f"{needed} pairs within {self.radius} nm; raise capacity_multiplier",
-            )
-        self._failure = "; ".join(causes)
-        raise ValueError(self._failure)
+        if flags:
+            causes = []
+            if flags & _INVALID_CELL:
+                causes.append("every cell length must be finite and above twice the cutoff")
+            if flags & _NON_FINITE:
+                causes.append("positions must be finite")
+            if flags & _OVERFLOW:
+                causes.append(
+                    f"the pair capacity {self.pair_capacity} is too small: the frame has "
+                    f"{needed} pairs within {self.radius} nm; raise capacity_multiplier",
+                )
+            self._failure = "; ".join(causes)
+            raise ValueError(self._failure)
+        try:
+            for inner in self._inner:
+                inner._check_status()
+        except ValueError as error:
+            self._failure = str(error)
+            raise
 
     def tensors(self) -> NeighborPairs:
         """Return the pairs of the last build, the ``NeighborPairs`` that models take.
 
-        Raises ``RuntimeError`` before ``allocate`` or after a failure.
+        The inner lists' pairs are in its ``inner``, ascending. Raises ``RuntimeError`` before
+        ``allocate`` or after a failure.
         """
         buffers = self._live_buffers()
-        return NeighborPairs(buffers.pairs, buffers.sorted_ids.numel(), self._cutoff)
+        inner = tuple(listed.tensors() for listed in self._inner)
+        return NeighborPairs(buffers.pairs, buffers.sorted_ids.numel(), self._cutoff, inner)
 
     @property
     def pair_capacity(self) -> int:
-        """C, the columns of the pair index; 0 before ``allocate``."""
+        """C, the columns of the list's own pair index; 0 before ``allocate``."""
         return self._buffers.pairs.shape[1] if self._buffers is not None else 0
 
     @property
     def num_pairs(self) -> int:
-        """The number of pairs of the last build.
+        """The number of the list's own pairs at the last build.
 
         Syncs with the host. Raises ``RuntimeError`` before ``allocate`` or after a failure.
         """

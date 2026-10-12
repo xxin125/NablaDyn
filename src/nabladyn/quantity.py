@@ -91,12 +91,13 @@ def energy_virial(energy_fn: Callable[..., Tensor]):
 
 
 def energy_force_virial(energy_fn: Callable[..., Tensor]):
-    """Bind (E, F, W): the energy and virial [3, 3] in kJ/mol, forces [N, 3] in kJ/mol/nm.
+    r"""Bind (E, F, W): the energy and virial [3, 3] in kJ/mol, forces [N, 3] in kJ/mol/nm.
 
     ``energy_fn`` is a model, or any energy with its call signature. The result is a
     function of ``(positions, cell, pairs)``, with ``pairs`` from a ``NeighborList``, that
-    returns all three from one evaluation. F = -dE/dpositions; W = -dE/dstrain at zero
-    strain, with no kinetic term, so the pressure is (2K + trace W) / (3V).
+    returns all three from one evaluation. $`F = -\partial E / \partial r`$ in the positions
+    r; $`W = -\partial E / \partial \varepsilon`$ in the strain $`\varepsilon`$, at zero
+    strain, with no kinetic term, so the pressure is $`(2K + \mathrm{tr}(W)) / (3V)`$.
     """
     gradient_and_value = torch.func.grad_and_value(_with_strain(energy_fn), argnums=(0, 1))
 

@@ -1,7 +1,7 @@
 """Fitting a potential's parameters to labeled frames.
 
-Frames are prepared once with their pair stack; compiled programs give a chunk's loss and
-gradient, or its channels; ``fit`` runs the updates.
+Frames are prepared once with their pair stacks; compiled programs give a chunk's loss
+and gradient, or its channels; ``fit`` runs the updates.
 """
 
 import dataclasses
@@ -43,7 +43,7 @@ def _batch_gradient(
 
     Real frames weigh 1/B and padding frames 0, so the chunk sums equal the batch's exactly.
     """
-    positions, cells, index, labels = prepared
+    positions, cells, stacks, labels = prepared
     total = None
     for chunk, real in _chunks(frames, size):
         chunk = chunk.to(positions.device)
@@ -53,7 +53,7 @@ def _batch_gradient(
             parameters,
             positions[chunk],
             cells[chunk],
-            index[chunk],
+            tuple(stack[chunk] for stack in stacks),
             {name: value[chunk] for name, value in labels.items()},
             coefficients,
             weights,
@@ -71,14 +71,18 @@ def _batch_gradient(
 
 
 def _prepared(model: Potential, data: Dataset, channels: tuple[str, ...]):
-    """Return (positions, cells, pair stack, labels) on the model's device and in its dtype."""
+    """Return (positions, cells, pair stacks, labels) on the model's device and in its dtype.
+
+    The pair stacks are a tuple, one per cutoff of ``model._list_cutoffs``.
+    """
 
     def move(value: Tensor) -> Tensor:
         return value.to(device=model.device, dtype=model.dtype)
 
     positions, cells = move(data.positions), move(data.cells)
     labels = {name: move(data.labels[name]) for name in channels}
-    return positions, cells, pair_stack(positions, cells, model.cutoff), labels
+    stacks = tuple(pair_stack(positions, cells, cutoff) for cutoff in model._list_cutoffs)
+    return positions, cells, stacks, labels
 
 
 def _errors(program, prepared, channels: tuple[str, ...], size: int) -> dict[str, float]:
@@ -86,12 +90,16 @@ def _errors(program, prepared, channels: tuple[str, ...], size: int) -> dict[str
 
     Syncs with the host.
     """
-    positions, cells, index, labels = prepared
+    positions, cells, stacks, labels = prepared
     squares = dict.fromkeys(channels, 0.0)
     with torch.no_grad():
         for chunk, real in _chunks(torch.arange(len(positions)), size):
             chunk = chunk.to(positions.device)
-            values = program(positions[chunk], cells[chunk], index[chunk])
+            values = program(
+                positions[chunk],
+                cells[chunk],
+                tuple(stack[chunk] for stack in stacks),
+            )
             for name in channels:
                 error = values[name][:real] - labels[name][chunk[:real]]
                 squares[name] = squares[name] + error.square().sum()
@@ -237,24 +245,25 @@ def pair_stack(positions: Tensor, cells: Tensor, cutoff: float) -> Tensor:
 def gradient_program(model: nn.Module, channels: tuple[str, ...]):
     """Return the compiled loss of a chunk of m frames and its gradient in the trained parameters.
 
-    The program takes (parameters, positions [m, N, 3], cells [m, 3], index [m, 2, C], labels,
+    The program takes (parameters, positions [m, N, 3], cells [m, 3], stacks, labels,
     coefficients [m], weights, scales) and returns (gradient, (loss, terms)). ``parameters``
-    maps trained parameter names to values. Coefficients, weights and scales are tensors, so
-    new values do not recompile.
+    maps trained parameter names to values; ``stacks`` holds the pair indices [m, 2, C_k],
+    one per cutoff of the model's ``_list_cutoffs``. Coefficients, weights and scales are
+    tensors, so new values do not recompile.
     """
 
     def loss_and_gradient(
         parameters,
         positions,
         cells,
-        index,
+        stacks,
         labels,
         coefficients,
         weights,
         scales,
     ):
         def loss(trained):
-            predicted = _loss.predict(model, trained, positions, cells, index, channels)
+            predicted = _loss.predict(model, trained, positions, cells, stacks, channels)
             return _loss.loss(predicted, labels, weights, scales, coefficients)
 
         return torch.func.grad_and_value(loss, has_aux=True)(parameters)
@@ -265,12 +274,12 @@ def gradient_program(model: nn.Module, channels: tuple[str, ...]):
 def values_program(model: nn.Module, channels: tuple[str, ...]):
     """Return the compiled channels of a chunk of frames at the model's own parameters.
 
-    The program takes (positions [m, N, 3], cells [m, 3], index [m, 2, C]) and returns the
-    channels by name.
+    The program takes (positions [m, N, 3], cells [m, 3], stacks), the stacks as for
+    ``gradient_program``, and returns the channels by name.
     """
 
-    def values(positions: Tensor, cells: Tensor, index: Tensor) -> dict[str, Tensor]:
-        return _loss.predict(model, {}, positions, cells, index, channels)
+    def values(positions: Tensor, cells: Tensor, stacks: tuple[Tensor, ...]) -> dict[str, Tensor]:
+        return _loss.predict(model, {}, positions, cells, stacks, channels)
 
     return _compile(values)
 
@@ -335,11 +344,12 @@ def fit(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     echo_every: Integral | None = None,
 ) -> Report:
-    """Fit the model's trained parameters to the training labels and return a ``Report``.
+    r"""Fit the model's trained parameters to the training labels and return a ``Report``.
 
     Trained parameters are those that require gradients. A channel enters the loss when its
-    weight is given (``energy``, ``forces``, ``virial``), as weight x mean ((X - X*) / s)^2
-    with the scale s from the training labels. Each of the ``updates`` takes the next batch
+    weight w is given (``energy``, ``forces``, ``virial``), as
+    $`w \cdot \mathrm{mean}[((X - X^*) / s)^2]`$ with the scale s from the training
+    labels. Each of the ``updates`` takes the next batch
     of ``batch_size`` frames (each epoch a new shuffle from ``seed``, its last batch the
     remainder), writes the gradient of the batch's mean loss into ``.grad`` and calls
     ``optimizer.step()``. Rows the model does not train keep their values. Parameters change

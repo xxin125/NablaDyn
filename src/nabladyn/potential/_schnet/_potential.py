@@ -75,13 +75,49 @@ class _Interaction(nn.Module):
         values = self.atoms(x)
         filters = self.filter2(_shifted_softplus(self.filter1(basis))) * envelope[:, None]
         # Each pair is listed once and its filter is symmetric, so it sends to both atoms.
-        # Out of place, since in-place index_add_ fails under the fit's vmap over frames.
+        # A fit's vmap over frames maps scatter_add as one sum, index_add one frame at a time;
+        # index_put's batched form compiles wrongly here. Out of place, since the in-place form
+        # fails under vmap.
+        width = x.shape[1]
         messages = (
             x.new_zeros(x.shape)
-            .index_add(0, first, filters * values[second])
-            .index_add(0, second, filters * values[first])
+            .scatter_add(0, first[:, None].expand(-1, width), filters * values[second])
+            .scatter_add(0, second[:, None].expand(-1, width), filters * values[first])
         )
         return x + self.update2(_shifted_softplus(self.update1(messages)))
+
+
+def _pair_geometry(
+    positions: Tensor,
+    cell: Tensor,
+    pairs: NeighborPairs,
+    strain: Tensor | None,
+    cutoff: float,
+    centres: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return the pairs' atoms, strained vectors, distances, envelope and Gaussians.
+
+    For the list's C pairs: first and second [C], d = r_first - r_second [C, 3] of the minimum
+    image and strained, r [C], the envelope [C] and the Gaussians [C, K] at the ``centres``
+    [K]. Masked pairs, padding self-pairs and pairs beyond the cutoff, have r = 1 and an
+    envelope of 0.
+    """
+    first, second = pairs.index[0], pairs.index[1]
+    vectors = space._displacement_wrapped(positions[first], positions[second], cell)
+    vectors = space.strained(vectors, strain)
+    squared = vectors.square().sum(dim=-1)
+    # Padding columns are self-pairs; list pairs beyond the cutoff lie in the skin.
+    valid = (first != second) & (squared < cutoff**2)
+    # Masked columns take r^2 = 1 before the root, whose gradient at a self-pair's r = 0
+    # would be infinite even behind torch.where.
+    distance = torch.where(valid, squared, 1.0).sqrt()
+    # The envelope and its slope vanish at the cutoff and it is 0 on masked columns, so
+    # every filter, and with it E and F, goes smoothly to 0.
+    cosine = 0.5 * (torch.cos(distance * (math.pi / cutoff)) + 1.0)
+    envelope = torch.where(valid, cosine, 0.0)
+    width = cutoff / (centres.numel() - 1)
+    basis = torch.exp(-0.5 * ((distance[:, None] - centres) / width).square())
+    return first, second, vectors, distance, envelope, basis
 
 
 class SchNet(Potential):
@@ -158,20 +194,14 @@ class SchNet(Potential):
         pairs: NeighborPairs,
         strain: Tensor | None = None,
     ) -> Tensor:
-        first, second = pairs.index[0], pairs.index[1]
-        vectors = space._displacement_wrapped(positions[first], positions[second], cell)
-        squared = space.strained(vectors, strain).square().sum(dim=-1)
-        # Padding columns are self-pairs; list pairs beyond the cutoff lie in the skin.
-        valid = (first != second) & (squared < self._cutoff**2)
-        # Masked columns take r^2 = 1 before the root, whose gradient at a self-pair's r = 0
-        # would be infinite even behind torch.where.
-        distance = torch.where(valid, squared, 1.0).sqrt()
-        # The envelope and its slope vanish at the cutoff and it is 0 on masked columns, so
-        # every filter, and with it E and F, goes smoothly to 0.
-        cosine = 0.5 * (torch.cos(distance * (math.pi / self._cutoff)) + 1.0)
-        envelope = torch.where(valid, cosine, 0.0)
-        width = self._cutoff / (self._centres.numel() - 1)
-        basis = torch.exp(-0.5 * ((distance[:, None] - self._centres) / width).square())
+        first, second, _, _, envelope, basis = _pair_geometry(
+            positions,
+            cell,
+            pairs,
+            strain,
+            self._cutoff,
+            self._centres,
+        )
         x = self.embedding[self.atom_types]
         for block in self.blocks:
             x = block(x, basis, envelope, first, second)

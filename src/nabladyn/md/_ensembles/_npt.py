@@ -288,16 +288,16 @@ def npt(
     thermostat: ChainState | None = None,
     barostat: BarostatState | None = None,
 ) -> Simulation:
-    """Build a simulation at constant pressure and temperature, by isotropic MTK.
+    r"""Build a simulation at constant pressure and temperature, by isotropic MTK.
 
     MTK is Martyna-Tobias-Klein dynamics. Takes the arguments of ``nvt``, plus ``pressure``
-    in kJ/mol/nm^3 (``units.BAR`` converts), ``barostat_timescale`` tau_b in ps and, to
+    in kJ/mol/nm^3 (``units.BAR`` converts), ``barostat_timescale`` $`\tau_b`$ in ps and, to
     continue a run, the ``barostat`` state. Nose-Hoover chains of 3 thermostats act on the
-    particles and on the barostat; the box mass is 3 (N + 1) kT tau_b^2. The cell keeps its
-    aspect ratio and scales about the origin.
+    particles and on the barostat; the box mass is $`3(N + 1) k_B T \tau_b^2`$. The cell
+    keeps its aspect ratio and scales about the origin.
 
     The panel of samples (``FIELDS``, see ``Simulation.run``) adds ``volume`` in nm^3 and
-    ``conserved_energy``: U + K plus P V, the box's kinetic energy and both chains'
+    ``conserved_energy``: $`U + K`$ plus $`PV`$, the box's kinetic energy and both chains'
     energies. Started far from ``pressure``, the box oscillates, as with any extended-system
     barostat.
 

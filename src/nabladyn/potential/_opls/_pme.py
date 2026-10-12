@@ -134,9 +134,10 @@ def spread(charges: Tensor, positions: Tensor, cell: Tensor, mesh: tuple[int, in
         * weights[:, 1, None, :, None]
         * weights[:, 2, None, None, :]
     )
-    # Out of place: the in-place index_add_ fails under vmap, which a fit maps over frames.
+    # A fit's vmap over frames maps scatter_add as one sum, index_add one frame at a time; out of
+    # place, since the in-place form fails under vmap.
     empty = values.new_zeros(mesh[0] * mesh[1] * mesh[2])
-    return empty.index_add(0, flat.reshape(-1), values.reshape(-1)).view(mesh)
+    return empty.scatter_add(0, flat.reshape(-1), values.reshape(-1)).view(mesh)
 
 
 def _reciprocal_squares(

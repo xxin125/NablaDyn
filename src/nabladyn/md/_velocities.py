@@ -43,7 +43,7 @@ def maxwell_boltzmann(masses: Tensor, temperature: Real, seed: Integral) -> Tens
     """Draw velocities from the Maxwell-Boltzmann distribution at ``temperature`` in K.
 
     Returns velocities [N, 3] in nm/ps for ``masses`` [N] in Da, in their dtype and on their
-    device, with zero total momentum and scaled to exactly ``temperature`` over 3N - 3
+    device, with zero total momentum and scaled to exactly ``temperature`` over $`3N - 3`$
     degrees of freedom. ``seed`` fixes the draw on any device. Syncs with the host.
 
     Raises ``ValueError`` unless ``masses`` is a finite positive float32 or float64 vector

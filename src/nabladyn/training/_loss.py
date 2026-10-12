@@ -46,16 +46,23 @@ def scales(
     return result
 
 
-def frame_channels(energy, channels: tuple[str, ...], num_atoms: int, cutoff: float):
+def frame_channels(energy, channels: tuple[str, ...], num_atoms: int, cutoffs: tuple[float, ...]):
     """Return a one-frame function giving ``channels`` of ``energy``, such as a Potential.
 
     ``channels`` is a nonempty subsequence of ``CHANNELS``. The function takes positions
-    [N, 3], a cell [3] and a pair index [2, C] and returns a tuple in ``CHANNELS`` order.
+    [N, 3], a cell [3] and pair indices [2, C_k], one per cutoff of ``cutoffs`` (ascending),
+    and returns a tuple in ``CHANNELS`` order. The last index is the list; the others are its
+    inner lists.
     """
     evaluate = energy if channels == ("energy",) else _QUANTITIES[channels](energy)
 
-    def one(positions: Tensor, cell: Tensor, index: Tensor) -> tuple[Tensor, ...]:
-        values = evaluate(positions, cell, NeighborPairs(index, num_atoms, cutoff))
+    def one(positions: Tensor, cell: Tensor, indices: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
+        inner = tuple(
+            NeighborPairs(index, num_atoms, cutoff)
+            for index, cutoff in zip(indices[:-1], cutoffs[:-1])
+        )
+        pairs = NeighborPairs(indices[-1], num_atoms, cutoffs[-1], inner)
+        values = evaluate(positions, cell, pairs)
         return values if isinstance(values, tuple) else (values,)
 
     return one
@@ -66,15 +73,16 @@ def predict(
     parameters: Mapping[str, Tensor],
     positions: Tensor,
     cells: Tensor,
-    index: Tensor,
+    stacks: tuple[Tensor, ...],
     channels: tuple[str, ...],
 ) -> dict[str, Tensor]:
     """Return the channels of B frames by name, vmapped over the frames.
 
-    Takes positions [B, N, 3], cells [B, 3] and pair indices [B, 2, C], padded with
-    self-pairs that the model masks; gives energy [B], forces [B, N, 3], virial [B, 3, 3].
-    ``parameters`` replaces the named model parameters, so the channels are differentiable
-    in them. ``channels`` is a nonempty subsequence of ``CHANNELS``.
+    Takes positions [B, N, 3], cells [B, 3] and pair indices [B, 2, C_k], one per cutoff of
+    the model's ``_list_cutoffs``, each padded with self-pairs that the model masks; gives
+    energy [B], forces [B, N, 3], virial [B, 3, 3]. ``parameters`` replaces the named model
+    parameters, so the channels are differentiable in them. ``channels`` is a nonempty
+    subsequence of ``CHANNELS``.
     """
 
     def energy(
@@ -90,8 +98,8 @@ def predict(
             {"strain": strain},
         )
 
-    one = frame_channels(energy, channels, model.num_atoms, model.cutoff)
-    return dict(zip(channels, torch.func.vmap(one)(positions, cells, index)))
+    one = frame_channels(energy, channels, model.num_atoms, model._list_cutoffs)
+    return dict(zip(channels, torch.func.vmap(one)(positions, cells, stacks)))
 
 
 def loss(

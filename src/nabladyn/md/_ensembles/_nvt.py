@@ -145,12 +145,13 @@ def nvt(
     step: Integral = 0,
     thermostat: ChainState | None = None,
 ) -> Simulation:
-    """Build a simulation at constant temperature, by velocity Verlet and a Nose-Hoover chain.
+    r"""Build a simulation at constant temperature, by velocity Verlet and a Nose-Hoover chain.
 
-    Takes the arguments of ``nve``, plus ``temperature`` in K, ``thermostat_timescale`` tau
-    in ps and, to continue a run, the ``thermostat`` state (float64). The 3 chain masses are
-    g kT tau^2, kT tau^2 and kT tau^2, g = 3N - 3. The panel of samples (``FIELDS``, see
-    ``Simulation.run``) adds ``conserved_energy``: U + K plus the chain's energy.
+    Takes the arguments of ``nve``, plus ``temperature`` in K, ``thermostat_timescale``
+    $`\tau`$ in ps and, to continue a run, the ``thermostat`` state (float64). The 3 chain
+    masses are $`g k_B T \tau^2`$, $`k_B T \tau^2`$ and $`k_B T \tau^2`$, $`g = 3N - 3`$. The
+    panel of samples (``FIELDS``, see ``Simulation.run``) adds ``conserved_energy``: $`U + K`$
+    plus the chain's energy.
 
     Raises ``ValueError`` unless the temperature and the timescale are finite and positive,
     for fewer than 2 atoms or a ``thermostat`` that is not [3] float64 on the model's

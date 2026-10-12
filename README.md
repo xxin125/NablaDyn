@@ -14,8 +14,8 @@ float64.
 
 - **Molecular dynamics**: NVE (velocity Verlet), NVT (Nose-Hoover chains) and isotropic NPT
   (Martyna-Tobias-Klein), periodic orthorhombic cells, HDF5 sample files.
-- **Potentials**: Lennard-Jones; OPLS-AA with particle-mesh Ewald; SchNet; tabulated pair
-  potentials.
+- **Potentials**: Lennard-Jones; OPLS-AA with particle-mesh Ewald; SchNet and angular
+  SchNet; tabulated pair potentials; sums of them, such as a physics prior plus a network.
 - **Training**: supervised fitting of any trainable parameters to energies, forces and
   virials, with `torch.optim` optimizers (Adam, SGD, ...) and step-based schedulers.
 - **GPU neighbor lists**: a CUDA cell-list operator for PyTorch; skin-based reuse is
@@ -133,7 +133,7 @@ print(f"Temperature: {temperature:.1f} K, pressure: {pressure:.0f} bar")
 
 Units are nm, ps, Da (g/mol), kJ/mol, K and elementary charges; `nabladyn.units` converts
 (`units.BAR`, `units.ANGSTROM`, `units.KCAL_PER_MOL`, ...). Pair vectors are
-r_ij = r_i - r_j.
+$`r_{ij} = r_i - r_j`$.
 
 ## Neighbor lists
 
@@ -155,11 +155,11 @@ r = space.displacement(positions[i[real]], positions[j[real]], cell).norm(dim=-1
 r = r[r < pairs.cutoff]             # the list also holds the pairs within the skin
 ```
 
-- `NeighborList(cutoff, *, skin=0.0, capacity_multiplier=1.25)`: `allocate` sizes the list
-  for a frame and builds it, `update` reuses it for the next frames until an atom has moved
-  half the skin and then rebuilds, `tensors()` returns the pairs and `num_pairs` counts
-  them. It builds on the GPU with a cell list; cells are orthorhombic and periodic, and
-  positions may lie outside the cell.
+- `NeighborList(cutoff, *, skin=0.0, capacity_multiplier=1.25, inner_cutoffs=())`:
+  `allocate` sizes the list for a frame and builds it, `update` reuses it for the next
+  frames until an atom has moved half the skin and then rebuilds, `tensors()` returns the
+  pairs and `num_pairs` counts them. It builds on the GPU with a cell list; cells are
+  orthorhombic and periodic, and positions may lie outside the cell.
 - `pairs.index` is [2, C], int32, one pair (i, j) per column; `pairs.num_atoms` is N and
   `pairs.cutoff` the cutoff in nm.
 - The list holds each pair once, in either orientation, for every pair closer than the
@@ -173,6 +173,10 @@ r = r[r < pairs.cutoff]             # the list also holds the pairs within the s
 - The fixed shape is what lets the MD step compile once and replay as one CUDA Graph while
   the pairs change. A frame that needs more than C pairs makes `update` raise `ValueError`;
   the list then stays unusable until `allocate` sizes it again.
+- `inner_cutoffs=(0.6,)`, smaller cutoffs, makes the list also keep the pairs within each,
+  plus the skin, as inner lists of their own size, updated and checked with it;
+  `pairs.inner` holds them, ascending. A [sum of models](#sums-of-models) gives each model
+  the list at its own cutoff, and MD and training build these lists for it.
 
 ## Potentials
 
@@ -264,6 +268,34 @@ the same types, sizes and cutoff, in either dtype;
 [`cg_schnet_nvt.py`](examples/cg_schnet_nvt.py) loads the weights from
 [`cg_schnet_fit.py`](examples/cg_schnet_fit.py).
 
+### Angular SchNet
+
+```python
+model = potential.angular_schnet(
+    atom_types=types,    # int64 [N]
+    num_types=1,
+    cutoff=1.0,          # nm
+    channels=8,          # radial channels of the angle features
+    orders=2,            # highest Legendre order of the angle features
+    trainable=True,
+)
+```
+
+SchNet sees only distances, so it misses how an atom's neighbors sit around it: for one-bead
+coarse-grained methanol, the distribution of the angle between two neighbors of a bead. The
+angular SchNet adds once, to each atom's starting features, the correlations of its neighbors'
+directions: over the pairs of neighbors j, k of atom i, the Legendre polynomials
+$`P_1(\cos\theta_{jik})`$ to $`P_L`$ of their angle, L = `orders`, weighted by learned radial
+channels and normalized by the channels' own sums, so they need no calibration data. Orders 1
+and 2 hold the angle distribution's broad shape and the orders above 2 its finer shape. They
+come from sums over each atom's neighbors, never over its pairs of neighbors. It takes
+`schnet`'s other arguments, with the same defaults; with its angle layers zero it is SchNet.
+Alone, it has no repulsive core, since training sees no pair closer than the liquid's: at a
+cutoff of 0.6 nm the methanol network learned a barrier of only about 19 to 26 kJ/mol against
+two beads overlapping, and beads fused in MD; at 1.0 nm it learned about 57, as SchNet's 51,
+so the examples use 1.0 nm. [`cg_angular_schnet_fit.py`](examples/cg_angular_schnet_fit.py)
+trains it and [`cg_angular_schnet_nvt.py`](examples/cg_angular_schnet_nvt.py) runs it.
+
 ### Tabulated pair potential
 
 ```python
@@ -283,6 +315,33 @@ parameter, as in [`cg_table_fit.py`](examples/cg_table_fit.py), or is refined ou
 library, for example by Iterative Boltzmann Inversion ([Reith et al., J. Comput. Chem. 24,
 1624, 2003](https://doi.org/10.1002/jcc.10307);
 [`cg_table_ibi.py`](examples/cg_table_ibi.py)).
+
+### Sums of models
+
+```python
+prior = potential.tabulated(atom_types=types, table=table, start=start, cutoff=1.0)
+network = potential.angular_schnet(
+    atom_types=types,
+    num_types=1,
+    cutoff=0.6,
+    orders=5,
+    trainable=True,
+)
+model = potential.sum(prior, network)   # E = E_prior + E_network
+```
+
+The energies of two or more models add, $`E = \sum_k E_k`$, and with them their forces and
+virials: for example a physics prior plus a network that learns what the prior misses
+([Wang et al., ACS Cent. Sci. 5, 755, 2019](https://doi.org/10.1021/acscentsci.8b00913)).
+The sum holds the models themselves, not copies, and each trains as it was built to:
+fitting `model` above fits the network to the forces the held table misses,
+$`F^* - F_{\mathrm{prior}}`$, and trains `network` in place, so `network.state_dict()`
+saves it. A prior built with `trainable` trains too, and parameter groups give each model
+its own learning rate. The sum's cutoff is the largest of its models'; MD and training give
+each model a neighbor list at its own cutoff, so the 0.6 nm network above reads only its
+own pairs, not the table's 1.0 nm ones.
+[`cg_prior_angular_schnet_fit.py`](examples/cg_prior_angular_schnet_fit.py) trains it and
+[`cg_prior_angular_schnet_nvt.py`](examples/cg_prior_angular_schnet_nvt.py) runs it.
 
 ## Molecular dynamics
 
@@ -365,22 +424,27 @@ before, after = report.validation["forces"]   # RMS force error, kJ/mol/nm
 report.loss                                   # each update's batch loss
 ```
 
-- The loss sums, over the channels given a weight, the weight x mean((X - X*) / s)^2,
-  where s is the RMS of the channel's training labels (about their mean for energies and
-  virials). So channels in different units start on an equal footing, and the weights set
-  their balance. A label without a weight is ignored.
+- The loss sums, over the channels given a weight w,
+  $`w \cdot \mathrm{mean}[((X - X^*) / s)^2]`$, where s is the RMS of the channel's
+  training labels (about their mean for energies and virials). So channels in different
+  units start on an equal footing, and the weights set their balance. A label without a
+  weight is ignored.
 - Each update takes the next batch of `batch_size` frames, shuffled each epoch;
   `scheduler`, if given, steps after each update.
 - Only what the model was built to train changes: `trainable` in `lennard_jones`,
-  `schnet` and `tabulated`, down to single type-pair rows such as `{"sigma": [1]}`.
-  OPLS-AA does not train.
+  `schnet`, `angular_schnet` and `tabulated`, down to single type-pair rows such as
+  `{"sigma": [1]}`. OPLS-AA does not train, and a `sum` trains what each of its models was
+  built to train.
 - Parameters change in place. Calling `fit` again continues from them and from the
   optimizer's state, and a simulation of the same model runs with the new values at its
   next step.
 - Examples: [`lj_fit.py`](examples/lj_fit.py) (energies, forces and virials),
   [`lj_fit_rows.py`](examples/lj_fit_rows.py) (one row), and
-  [`cg_schnet_fit.py`](examples/cg_schnet_fit.py) and
-  [`cg_table_fit.py`](examples/cg_table_fit.py) (force matching).
+  [`cg_schnet_fit.py`](examples/cg_schnet_fit.py),
+  [`cg_angular_schnet_fit.py`](examples/cg_angular_schnet_fit.py),
+  [`cg_table_fit.py`](examples/cg_table_fit.py) and
+  [`cg_prior_angular_schnet_fit.py`](examples/cg_prior_angular_schnet_fit.py) (force
+  matching, the last on a held table).
 
 ## Building blocks
 
@@ -408,8 +472,9 @@ g = g / len(data["positions"])                                      # [1, bins],
 - `quantity` turns a model into a function of `(positions, cell, pairs)` that returns what
   it names: `energy_force_virial`, or only `force`, `energy_and_force`, `virial`,
   `force_virial` or `energy_virial`.
-- `observables`: `kinetic_energy`, `temperature`, `pressure` and `rdf`, the g(r) of each
-  type pair.
+- `observables`: `kinetic_energy`, `temperature`, `pressure`, `rdf`, the g(r) of each
+  type pair, and `adf`, the distribution of the angles between an atom's neighbors closer
+  than `r_max`.
 - `space`: periodic geometry. `wrap` maps positions into the cell and returns the lattice
   crossings; `displacement` gives minimum-image vectors.
 - `units`: factors into NablaDyn's units, such as `BAR`, `ATM`, `ANGSTROM`, `FS`,
@@ -424,7 +489,8 @@ Run them from the `NablaDyn` folder, for example `python examples/lj_nvt.py`; th
 `examples` extra (h5py and matplotlib). Each reads prepared data from `examples/data/`,
 which its docstring describes, puts its settings at the top of `main()` and prints its
 results. The fits and the coarse-grained examples also draw a figure in the working
-directory.
+directory. [`examples/README.md`](examples/README.md) describes each one, with its results
+and figure.
 
 *Lennard-Jones argon*
 
@@ -448,10 +514,14 @@ directory.
 | Example | What it shows |
 |---|---|
 | [cg_schnet_fit.py] | SchNet by force matching at three densities; saves `cg_schnet.pt` |
-| [cg_schnet_nvt.py] | runs `cg_schnet.pt` in NVT at the three densities |
+| [cg_schnet_nvt.py] | runs `cg_schnet.pt` in NVT; g(r), angles and pressure |
+| [cg_angular_schnet_fit.py] | angular SchNet by force matching; saves `cg_angular_schnet.pt` |
+| [cg_angular_schnet_nvt.py] | runs `cg_angular_schnet.pt` in NVT; g(r), angles and pressure |
 | [cg_table_fit.py] | a pair table by force matching; saves `cg_table.pt` |
 | [cg_table_ibi.py] | a pair table by Iterative Boltzmann Inversion; saves `cg_table_ibi.pt` |
-| [cg_table_nvt.py] | runs `cg_table.pt` or `cg_table_ibi.pt` in NVT at the three densities |
+| [cg_table_nvt.py] | runs `cg_table.pt` or `cg_table_ibi.pt` in NVT; g(r), angles and pressure |
+| [cg_prior_angular_schnet_fit.py] | angular SchNet on the held `cg_table.pt`; saves the network |
+| [cg_prior_angular_schnet_nvt.py] | runs the sum in NVT; g(r), angles and pressure |
 
 [lj_evaluate.py]: examples/lj_evaluate.py
 [lj_nvt.py]: examples/lj_nvt.py
@@ -462,49 +532,58 @@ directory.
 [opls_npt.py]: examples/opls_npt.py
 [cg_schnet_fit.py]: examples/cg_schnet_fit.py
 [cg_schnet_nvt.py]: examples/cg_schnet_nvt.py
+[cg_angular_schnet_fit.py]: examples/cg_angular_schnet_fit.py
+[cg_angular_schnet_nvt.py]: examples/cg_angular_schnet_nvt.py
 [cg_table_fit.py]: examples/cg_table_fit.py
 [cg_table_ibi.py]: examples/cg_table_ibi.py
 [cg_table_nvt.py]: examples/cg_table_nvt.py
+[cg_prior_angular_schnet_fit.py]: examples/cg_prior_angular_schnet_fit.py
+[cg_prior_angular_schnet_nvt.py]: examples/cg_prior_angular_schnet_nvt.py
 
 ### Coarse-grained methanol
 
 The coarse-grained examples map three all-atom NVT runs of 343 OPLS-AA methanol molecules at
 298.15 K (454.98, 473.54 and 492.85 Da/nm^3; 1,000 frames each) to one bead per molecule.
-The SchNet and table fits use force matching ([Izvekov and Voth, J. Phys. Chem. B 109, 2469,
-2005](https://doi.org/10.1021/jp044629q); [Noid et al., J. Chem. Phys. 128, 244114,
-2008](https://doi.org/10.1063/1.2938860)), and train on the first 800 frames of each density
-and validate on the rest, while Iterative Boltzmann Inversion (IBI) fits the g(r) at 474
-Da/nm^3 alone; the `_nvt` examples run each model for 100 ps at each density and compare its
-g(r) with the all-atom one:
+The SchNet, angular SchNet, table and table + angular SchNet fits use force matching
+([Izvekov and Voth, J. Phys. Chem. B 109, 2469, 2005](https://doi.org/10.1021/jp044629q);
+[Noid et al., J. Chem. Phys. 128, 244114, 2008](https://doi.org/10.1063/1.2938860)), and
+train on the first 800 frames of each density and validate on the rest, while Iterative
+Boltzmann Inversion (IBI) fits the g(r) at 474 Da/nm^3 alone. The `_nvt` examples run each
+model in NVT for 400 ps at each density and compare its g(r), its first-shell angle
+distribution (the angles between two neighbors closer than the g(r)'s first minimum) and its
+pressure with the all-atom ones:
 
-| Model | g(r) RMS deviation at 455 / 474 / 493 Da/nm^3 |
-|---|---|
-| SchNet, force matching | 0.017 / 0.019 / 0.026 |
-| pair table, force matching | 0.023 / 0.033 / 0.059 |
-| pair table, IBI at 474 | 0.025 / 0.010 / 0.034 |
+| Model | g(r) | Angles | Pressure |
+|---|---|---|---|
+| SchNet | 0.0172 / 0.0194 / 0.0252 | 1.45 / 1.43 / 1.47 | +81 / +71 / +64 |
+| angular SchNet | 0.0096 / 0.0088 / 0.0068 | 0.45 / 0.46 / 0.43 | +67 / +54 / +48 |
+| pair table, force matching | 0.0226 / 0.0309 / 0.0552 | 1.81 / 1.76 / 1.72 | +66 / +42 / +18 |
+| pair table, IBI at 474 | 0.0283 / 0.0076 / 0.0284 | 1.71 / 1.66 / 1.62 | +41 / +17 / -8 |
+| table + angular SchNet | 0.0088 / 0.0074 / 0.0091 | 0.18 / 0.15 / 0.16 | +74 / +66 / +62 |
+
+*At 455 / 474 / 493 Da/nm^3: the RMS deviations of the g(r) and of the first-shell angle
+distribution (1e-3 per degree) from the all-atom ones, and the mean pressure minus the
+all-atom one (kJ/mol/nm^3). Every model but the IBI table is fitted by force matching.*
 
 SchNet follows the structure at all three densities more closely than a pair table fitted
-to the same forces; IBI matches it best at the density it was fitted to.
+to the same forces; IBI matches it closely only at the density it was fitted to. The angular
+SchNet follows the g(r) more closely than SchNet and the force-matched table at every
+density, and the first-shell angles about three to four times more closely than any of
+them. The table + angular SchNet, a network at 0.6 nm with angle orders up to 5 on the
+held force-matched table, follows the g(r) about as closely and the first-shell angles two
+to three times more closely still. Force matching does not fit the pressure: every
+force-matched model's is too high, SchNet's furthest off, and the IBI table comes closest.
 
-<img src="docs/figures/cg_schnet_fit.png" alt="CG SchNet training" width="480">
+![CG models' g(r) against all-atom](docs/figures/cg_compare_rdf.png)
 
-*SchNet training: the batch loss and its running mean.*
+*The five models' g(r) against the all-atom one at the three densities, from their `_nvt`
+examples' 400 ps runs.*
 
-![CG SchNet in NVT at three densities](docs/figures/cg_schnet_nvt.png)
+![CG models' first-shell angles against all-atom](docs/figures/cg_compare_adf.png)
 
-*The SchNet model's g(r) against the all-atom one at the three densities.*
-
-![CG pair table by force matching](docs/figures/cg_table_fit.png)
-
-*The force-matched table: its loss, and the table against its Boltzmann-inversion start.*
-
-![CG pair table in NVT at three densities](docs/figures/cg_table_nvt.png)
-
-*The force-matched table's g(r) against the all-atom one at the three densities.*
-
-![CG pair table by Iterative Boltzmann Inversion](docs/figures/cg_table_ibi.png)
-
-*IBI: the g(r) deviation over 30 iterations, the table, and the final g(r).*
+*The five models' first-shell angle distributions against the all-atom one at the three
+densities, from the same runs. Each example's own figure is in the
+[examples README](examples/README.md).*
 
 ## Performance
 
@@ -514,18 +593,18 @@ Liquid argon in NVT on one RTX 5090, float32, in ns/day:
 
 | Atoms | NablaDyn | LAMMPS GPU package | JAX-MD |
 |---|---|---|---|
-| 512 | 8,949 | 6,237 | 5,234 |
-| 4,096 | 5,466 | 2,654 | 3,447 |
-| 13,824 | 3,634 | 1,113 | 1,939 |
-| 32,768 | 2,226 | 470 | 1,155 |
+| 512 | 9,288 | 6,190 | 5,207 |
+| 4,096 | 5,507 | 2,631 | 3,421 |
+| 13,824 | 3,632 | 1,080 | 1,940 |
+| 32,768 | 2,210 | 460 | 1,147 |
 
 The engines ran the same system: liquid argon with a shifted 12-6 Lennard-Jones pair, a 4 fs
 time step, Nose-Hoover chains of three at 120 K and a 0.1 nm skin, alternating seed by seed
 in one session (a 60 s warm-up, then three seeds, each the median of three timed runs).
 
-- **NablaDyn** 0.1.0 (torch 2.13): each step replays one captured CUDA Graph.
+- **NablaDyn** 0.2.0 (torch 2.13): each step replays one captured CUDA Graph.
 - **LAMMPS** ([Thompson et al., Comput. Phys. Commun. 271, 108171,
-  2022](https://doi.org/10.1016/j.cpc.2021.108171); stable 22 Jul 2025, Update 6): the GPU
+  2022](https://doi.org/10.1016/j.cpc.2021.108171); stable 22 Jul 2025, Update 5): the GPU
   package ([Brown et al., Comput. Phys. Commun. 182, 898,
   2011](https://doi.org/10.1016/j.cpc.2010.12.021)) in single precision, as one process;
   pair forces and neighbor lists run on the GPU and the integration on the host. The package
@@ -537,16 +616,16 @@ in one session (a 60 s warm-up, then three seeds, each the median of three timed
   1.25. `XLA_PYTHON_CLIENT_PREALLOCATE=false` stops JAX from reserving most of the GPU
   memory while the other engines run.
 
-NablaDyn is faster at every size: over LAMMPS by 1.4x at 512 atoms to 4.7x at 32,768, and
+NablaDyn is faster at every size: over LAMMPS by 1.5x at 512 atoms to 4.8x at 32,768, and
 over JAX-MD by 1.6x to 1.9x.
 
 ![NablaDyn MD speed](docs/figures/benchmark.png)
 
 *NablaDyn's MD speed in float32 on an RTX 5090: NVT with a 0.1 nm neighbor skin, liquid
-argon at 4 fs, OPLS-AA methanol with PME at 0.5 fs, and coarse-grained methanol (SchNet and
-a pair table) at 4 fs. Each point is the mean over three velocity seeds after a 60 s
-warm-up, each seed the median of three timed repeats; the error bars are the standard
-deviation.*
+argon at 4 fs, OPLS-AA methanol with PME at 0.5 fs, and coarse-grained methanol (SchNet, a
+pair table, the angular SchNet, and a table plus an angular SchNet) at 4 fs. Each point is
+the mean over three velocity seeds after a 60 s warm-up, each seed the median of three timed
+repeats; the error bars are the standard deviation.*
 
 ## Validation
 
@@ -559,34 +638,37 @@ tolerance fixed before the check:
 | Lennard-Jones | LAMMPS's `pair lj/cut` in float64 |
 | OPLS-AA with PME | OpenMM, GROMACS and LAMMPS on one methanol frame; a NumPy reference |
 | SchNet | an independent float64 PyTorch implementation |
+| Angular SchNet | an independent float64 PyTorch implementation |
 | Tabulated pair potential | a NumPy reference, for energy, forces, virial and fit gradients |
+| Sums of models | each model alone on its own list; inner lists against standalone lists |
 | Derivatives | forces, virials and parameter gradients against central differences |
 | MD, step by step | LAMMPS's `fix nve`, `nvt` and `npt iso` in float64, to 1e-12 over 20 steps |
 | MD statistics | energy conservation; the canonical and isothermal-isobaric distributions |
 | Training | loss gradients against analytic derivatives and central differences |
 | g(r) | a NumPy reference; an ideal gas reads 1 |
+| Angle distribution | a NumPy reference; an ideal gas follows $`\sin\theta / 2`$ |
 
 ## Scope and outlook
 
-NablaDyn 0.1 covers:
+NablaDyn covers:
 
 - NVIDIA GPUs with CUDA; there is no CPU path.
 - Periodic orthorhombic cells; NPT is isotropic.
-- The four built-in potentials; a model of your own cannot be plugged in yet.
+- The five built-in potentials and sums of them; a model of your own cannot be plugged in
+  yet.
 - Training on energies, forces and virials. MD runs are not differentiable, so a model
   cannot yet be trained on an MD observable such as g(r).
 
 Planned:
 
-- Training on MD observables, such as g(r) or the density, by differentiable trajectory
-  reweighting ([Thaler and Zavadlav, Nat. Commun. 12, 6884,
+- In 0.3, training on MD observables, such as g(r) or the density, by differentiable
+  trajectory reweighting ([Thaler and Zavadlav, Nat. Commun. 12, 6884,
   2021](https://doi.org/10.1038/s41467-021-27241-4)).
 - Differentiable MD over short trajectories, by backpropagation through the steps, for
   dynamical targets such as diffusion.
 - Tabulated bonded terms (bonds, angles and dihedrals) alongside the pair tables, for
   complete coarse-grained force fields.
 - An equivariant machine-learning potential, beyond SchNet.
-- Combining models, such as a pair-table prior plus a network.
 
 ## License
 

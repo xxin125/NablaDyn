@@ -1,7 +1,7 @@
 # NablaDyn API
 
 A guide to the functions and classes you use, in the order you meet them. Each entry is the
-docstring of NablaDyn 0.1.0, so it matches this version. Less common helpers are documented in their
+docstring of NablaDyn 0.2.0, so it matches this version. Less common helpers are documented in their
 docstrings: `help(nabladyn.<module>)`.
 
 ## Neighbor lists
@@ -14,7 +14,13 @@ yourself for single frames, analysis and your own loops.
 ### neighbors.NeighborList
 
 ```python
-neighbors.NeighborList(cutoff: Real, *, skin: Real = 0.0, capacity_multiplier: Real = 1.25)
+neighbors.NeighborList(
+    cutoff: Real,
+    *,
+    skin: Real = 0.0,
+    capacity_multiplier: Real = 1.25,
+    inner_cutoffs: tuple[Real, ...] = (),
+)
 ```
 
 Pairs of atoms closer than the list radius, cutoff + skin, in nm.
@@ -24,8 +30,14 @@ and builds it. `update` reuses the pairs until an atom has moved far enough that
 within the cutoff could be missing, then rebuilds. `tensors()` returns the pairs. Cells
 are orthorhombic and periodic; positions may lie outside the cell.
 
+For each of `inner_cutoffs`, smaller cutoffs in nm, the list also keeps an inner list:
+the pairs within that cutoff + skin, with the same skin and capacity rule, allocated,
+updated and checked with this one. `tensors()` returns them in `NeighborPairs.inner`;
+a sum of models gives each model the list at its own cutoff.
+
 Raises `ValueError` unless `cutoff` is positive, `skin` nonnegative and
-`capacity_multiplier` at least 1, all finite.
+`capacity_multiplier` at least 1, all finite, and the inner cutoffs distinct numbers
+between 0 and `cutoff`.
 
 #### NeighborList.allocate
 
@@ -35,8 +47,9 @@ allocate(positions: Tensor, cell: Tensor) -> None
 
 Count the pairs of positions [N, 3] in the cell [3], size the list and build it.
 
-Positions and cell are CUDA float32 or float64 tensors in nm. It also recovers a
-list that failed an update. Syncs with the host.
+Positions and cell are CUDA float32 or float64 tensors in nm. The inner lists are
+allocated after the list; one that cannot be leaves the list failed until `allocate`
+succeeds. It also recovers a list that failed an update. Syncs with the host.
 
 Raises `TypeError` or `ValueError` for invalid positions or cell, and
 `ValueError` when the grid or the pairs do not fit int32.
@@ -49,16 +62,17 @@ update(positions: Tensor, cell: Tensor) -> None
 
 Reuse the pairs for positions [N, 3] in the cell [3], or rebuild them.
 
-The pairs are reused while no atom has moved more than (R s_min - cutoff) / 2 from its
-position at the last rebuild, scaled with the cell; R is the list radius and s_min the
-smallest ratio of a cell length to its length then. In a fixed cell that is half the
-skin, so zero skin rebuilds every time. Syncs with the host.
+The pairs are reused while no atom has moved more than $`(R s_{\min} - r_c) / 2`$ from
+its position at the last rebuild, scaled with the cell; R is the list radius,
+$`r_c`$ the cutoff and $`s_{\min}`$ the smallest ratio of a cell length to its length
+then. In a fixed cell that is half the skin, so zero skin rebuilds every time. Each
+inner list follows the same rule. Syncs with the host.
 
 Raises `TypeError` or `ValueError` for positions or a cell of the wrong kind or
 unlike the allocated ones. Raises `ValueError`, and fails the list until
 `allocate`, for a cell length not finite or not above twice the cutoff, a coordinate
-that is not finite, or more pairs than the capacity. Raises `RuntimeError` before
-`allocate` or after a failure.
+that is not finite, or more pairs than the capacity of the list or an inner list.
+Raises `RuntimeError` before `allocate` or after a failure.
 
 #### NeighborList.tensors
 
@@ -68,7 +82,8 @@ tensors() -> NeighborPairs
 
 Return the pairs of the last build, the `NeighborPairs` that models take.
 
-Raises `RuntimeError` before `allocate` or after a failure.
+The inner lists' pairs are in its `inner`, ascending. Raises `RuntimeError` before
+`allocate` or after a failure.
 
 #### NeighborList.num_pairs
 
@@ -76,7 +91,7 @@ Raises `RuntimeError` before `allocate` or after a failure.
 property num_pairs: int
 ```
 
-The number of pairs of the last build.
+The number of the list's own pairs at the last build.
 
 Syncs with the host. Raises `RuntimeError` before `allocate` or after a failure.
 
@@ -85,8 +100,9 @@ Syncs with the host. Raises `RuntimeError` before `allocate` or after a failure.
 Each constructor returns a model: a PyTorch module with one scalar energy in kJ/mol.
 `model(positions, cell, pairs)` gives the energy of a frame, with `pairs` from a `NeighborList` at
 the model's cutoff, and `quantity` gives forces and virial. A model computes in the dtype and on the
-device of its parameters. `lennard_jones`, `schnet` and `tabulated` take `trainable`, the parameters
-that `training.fit` may change.
+device of its parameters. `lennard_jones`, `schnet`, `angular_schnet` and `tabulated` take
+`trainable`, the parameters that `training.fit` may change; `sum` adds models, and each model trains
+as it was built to.
 
 ### potential.lennard_jones
 
@@ -103,14 +119,19 @@ potential.lennard_jones(
 
 Build a 12-6 Lennard-Jones model shifted to zero at the cutoff.
 
-E sums u(r) = 4 eps [(sigma/r)^12 - (sigma/r)^6] - u_c over the pairs closer than the
-cutoff rc, with u_c = 4 eps [(sigma/rc)^12 - (sigma/rc)^6] of each pair's own sigma and
-epsilon. E is continuous at rc and is the energy MD conserves and samples. u_c is
-constant, so forces and virial are those of the unshifted potential; the force steps
-to zero at rc.
+E sums, over the pairs closer than the cutoff $`r_c`$,
+
+```math
+u(r) = 4\varepsilon [(\sigma/r)^{12} - (\sigma/r)^6] - u_c,
+\quad u_c = 4\varepsilon [(\sigma/r_c)^{12} - (\sigma/r_c)^6],
+```
+
+with each pair's own sigma and epsilon. E is continuous at $`r_c`$ and is the energy MD
+conserves and samples. $`u_c`$ is constant, so forces and virial are those of the
+unshifted potential; the force steps to zero at $`r_c`$.
 
 `atom_types` [N], int64 in [0, T), fixes the atoms. `sigma` (nm) and `epsilon`
-(kJ/mol) hold T(T+1)/2 values each, one per unordered type pair in the order (0, 0),
+(kJ/mol) hold $`T(T+1)/2`$ values each, one per unordered type pair in the order (0, 0),
 (0, 1), ..., (1, 1), ...; no mixing rule is applied. `cutoff` is in nm. `trainable`
 names what a fit trains, among "sigma" and "epsilon": a tuple trains every row of each;
 a mapping trains only the listed rows, as {"epsilon": [1]} for (0, 1), and holds the
@@ -119,7 +140,7 @@ computes in the dtype and on the device of `sigma`. Syncs with the host.
 
 Raises `ValueError` for a `trainable` that names other parameters or rows outside
 [0, T(T+1)/2), a cutoff that is not finite and positive, parameters that are not finite
-positive float vectors of T(T+1)/2 values, or atom types outside [0, T).
+positive float vectors of $`T(T+1)/2`$ values, or atom types outside [0, T).
 
 ### potential.opls
 
@@ -136,25 +157,42 @@ potential.opls(
 
 Build an OPLS-AA model of a fixed topology, with Coulomb by smooth particle-mesh Ewald.
 
-U = sum_bonds 0.5 k (r - r0)^2 + sum_angles 0.5 k (theta - theta0)^2 +
-sum_dihedrals k [1 + cos(n phi - phase)] + U_LJ + U_C, each term with its type's row of
-`parameters`. theta = atan2(|a x b|, a . b) with a = r_i - r_j and b = r_k - r_j; phi
-is the IUPAC dihedral of i-j-k-l in (-pi, pi], 0 cis and pi trans. Every vector is the
-minimum image, so a molecule must span less than half of each cell length.
+```math
+U = \sum_{\mathrm{bonds}} 0.5 k (r - r_0)^2
++ \sum_{\mathrm{angles}} 0.5 k (\theta - \theta_0)^2
++ \sum_{\mathrm{dihedrals}} k [1 + \cos(n\phi - \mathrm{phase})]
++ U_{\mathrm{LJ}} + U_{\mathrm{C}},
+```
+
+each term with its type's row of `parameters`. The angle is
+
+```math
+\theta = \mathrm{atan2}(\lvert a \times b \rvert, a \cdot b)
+```
+
+with $`a = r_i - r_j`$ and $`b = r_k - r_j`$; $`\phi`$ is the IUPAC dihedral of i-j-k-l in
+$`(-\pi, \pi]`$, 0 cis and $`\pi`$ trans. Every vector is the minimum image, so a molecule
+must span less than half of each cell length.
 
 `topology.bonds` sets the pair classes. Pairs 1 or 2 bonds apart do not interact; 1-4
-pairs, 3 bonds apart, count 0.5 u(r) + 0.5 C q_i q_j / r at any distance, unshifted.
-Other pairs within the cutoff count u(r) - u(rc) and the real-space Ewald term
-C q_i q_j [erfc(alpha r)/r - erfc(alpha rc)/rc], both zero at rc; an order-5 smooth PME
-mesh adds every pair's long-range part, less the self and net-charge terms. Here
-u(r) = 4 eps [(sigma/r)^12 - (sigma/r)^6] with sigma = sqrt(sigma_a sigma_b) and
-eps = sqrt(eps_a eps_b) of the two atoms' LJ types; a zero product gives no term, and a
-zero sigma or epsilon gets zero gradient. C is `units.COULOMB`; q are the charges.
+pairs, 3 bonds apart, count $`0.5 u(r) + 0.5 C q_i q_j / r`$ at any distance, unshifted.
+Other pairs within the cutoff $`r_c`$ count $`u(r) - u(r_c)`$ and the real-space Ewald term
 
-`cell` [3], in nm, plans the Ewald splitting once for `ewald_tolerance` delta, about
-the relative force error: alpha = sqrt(-ln(2 delta)) / cutoff, and about
-2 alpha L / (3 delta^(1/5)) mesh points per axis, rounded up to a product of 2, 3 and 5.
-Both stay fixed as `model.alpha` (nm^-1) and `model.mesh`, so accuracy drops silently
+```math
+C q_i q_j [\mathrm{erfc}(\alpha r)/r - \mathrm{erfc}(\alpha r_c)/r_c],
+```
+
+both zero at $`r_c`$; an order-5 smooth PME mesh adds every pair's long-range part, less
+the self and net-charge terms. Here $`u(r) = 4\varepsilon [(\sigma/r)^{12} - (\sigma/r)^6]`$
+with $`\sigma = \sqrt{\sigma_a \sigma_b}`$ and
+$`\varepsilon = \sqrt{\varepsilon_a \varepsilon_b}`$ of the two atoms' LJ types; a zero
+product gives no term, and a zero sigma or epsilon gets zero gradient. C is
+`units.COULOMB`; q are the charges.
+
+`cell` [3], in nm, plans the Ewald splitting once for `ewald_tolerance` $`\delta`$,
+about the relative force error: $`\alpha = \sqrt{-\ln(2\delta)} / r_c`$, and about
+$`2\alpha L / (3\delta^{1/5})`$ mesh points per axis, rounded up to a product of 2, 3 and
+5. Both stay fixed as `model.alpha` (nm^-1) and `model.mesh`, so accuracy drops silently
 in a larger cell: plan with the largest cell a run visits.
 
 `topology` is an `opls.Topology` and `parameters` an `opls.Parameters`; their
@@ -225,10 +263,11 @@ Vectors of one float dtype, float32 or float64, on one device, except
 - `charge` [Tq] in e;
 - `sigma` [Tlj] in nm and `epsilon` [Tlj] in kJ/mol, both >= 0, mixed geometrically
   for each pair; a type with epsilon 0 has no Lennard-Jones term;
-- `bond_r0` [Tb] in nm and `bond_k` [Tb] in kJ/mol/nm^2: 0.5 k (r - r0)^2;
-- `angle_theta0` [Ta] in rad and `angle_k` [Ta] in kJ/mol/rad^2: 0.5 k (theta - theta0)^2;
-- `dihedral_k` [Td] in kJ/mol, `dihedral_periodicity` [Td], n >= 1, and
-  `dihedral_phase` [Td] in rad: k [1 + cos(n phi - phase)].
+- `bond_r0` [Tb] in nm and `bond_k` [Tb] in kJ/mol/nm^2: $`0.5 k (r - r_0)^2`$;
+- `angle_theta0` [Ta] in rad and `angle_k` [Ta] in kJ/mol/rad^2:
+  $`0.5 k (\theta - \theta_0)^2`$;
+- `dihedral_k` [Td] in kJ/mol, `dihedral_periodicity` [Td], $`n \ge 1`$, and
+  `dihedral_phase` [Td] in rad: $`k [1 + \cos(n\phi - \mathrm{phase})]`$.
 
 ### potential.schnet
 
@@ -249,14 +288,20 @@ potential.schnet(
 
 Build a SchNet network (Schütt et al., J. Chem. Phys. 148, 241722, 2018).
 
-Each atom starts from its type's row of a table [T, F], x_i = table[t_i]. Each of the
-`interactions` blocks adds ssp(m_i D1 + d1) D2 + d2, where m_i sums f_ij x_j A over
-the pairs within the cutoff, each pair sending to both its atoms. The filter is
-f_ij = (ssp(g(r_ij) B1 + b1) B2 + b2) C(r_ij), with K = `gaussians` fixed Gaussians
-g_k(r) = exp(-(r - k D)^2 / (2 D^2)), D = cutoff / (K - 1), and the envelope
-C(r) = (1 + cos(pi r / cutoff)) / 2, so a pair's contribution to the energy and forces
-vanishes smoothly at the cutoff. The energy is E = sum_i ssp(x_i R1 + e1) R2 + e2 in
-kJ/mol, with ssp(x) = ln(1 + e^x) - ln 2.
+Each atom starts from its type's row of a table [T, F], $`x_i = \mathrm{table}[t_i]`$.
+Each of the `interactions` blocks adds $`\mathrm{ssp}(m_i D_1 + d_1) D_2 + d_2`$,
+where $`m_i`$ sums $`f_{ij} x_j A`$ over the pairs within the cutoff $`r_c`$, each pair
+sending to both its atoms. The filter is
+
+```math
+f_{ij} = (\mathrm{ssp}(g(r_{ij}) B_1 + b_1) B_2 + b_2) C(r_{ij}),
+```
+
+with K = `gaussians` fixed Gaussians $`g_k(r) = \exp(-(r - kD)^2 / (2D^2))`$,
+$`D = r_c / (K - 1)`$, and the envelope $`C(r) = (1 + \cos(\pi r / r_c)) / 2`$, so a pair's
+contribution to the energy and forces vanishes smoothly at the cutoff. The energy is
+$`E = \sum_i \mathrm{ssp}(x_i R_1 + e_1) R_2 + e_2`$ in kJ/mol, with
+$`\mathrm{ssp}(x) = \ln(1 + e^x) - \ln 2`$.
 
 `atom_types` [N], int64 in [0, `num_types`), fixes the atoms and the device;
 `cutoff` is in nm. `features` F, even, sizes the table, filters and blocks; the
@@ -269,6 +314,107 @@ other atoms with the same types and sizes. Syncs with the host.
 Raises `ValueError` for sizes that are not integers in range or an odd `features`,
 a cutoff that is not finite and positive, a `dtype` other than float32 or float64,
 or atom types outside [0, `num_types`).
+
+### potential.angular_schnet
+
+```python
+potential.angular_schnet(
+    *,
+    atom_types: Tensor,
+    num_types: int,
+    cutoff: Real,
+    features: int = 64,
+    interactions: int = 3,
+    gaussians: int = 50,
+    channels: int = 8,
+    orders: int = 2,
+    trainable: bool = False,
+    seed: int = 0,
+    dtype: torch.dtype = torch.float32,
+) -> Potential
+```
+
+Build a SchNet network whose atoms also start from angle features of their neighbors.
+
+The network is `schnet`'s, with each atom's starting features
+
+```math
+x_i = \mathrm{table}[t_i] + \mathrm{ssp}(f_i A_1 + a_1) A_2 + a_2.
+```
+
+The features come from M = `channels` learned radial channels
+$`R_m(r) = C(r) \sum_k g_k(r) W_{km}`$, with the envelope C and the Gaussians $`g_k`$ of
+`schnet`. Over atom i's neighbors j within the cutoff, with $`u_{ij}`$ the unit vector of
+$`r_i - r_j`$, the sums
+
+```math
+S_{im} = \sum_j R_m(r_{ij}), \quad V_{im} = \sum_j R_m(r_{ij}) u_{ij},
+\quad Q_{im} = \sum_j R_m(r_{ij}) (u_{ij} u_{ij}^T - I/3),
+\quad T_{iml} = \sum_j R_m(r_{ij}) R_l(r_{ij}),
+```
+
+and the smooth neighbor count $`n_i = \sum_j C(r_{ij})`$, give the $`M + M(M + 1)`$
+features $`s_{im} = S_{im} / (1 + n_i)`$ and, for $`m \le l`$,
+
+```math
+(V_{im} \cdot V_{il} - T_{iml}) / D_{iml}, \quad
+(\mathrm{Tr}(Q_{im} Q_{il}) - 2 T_{iml} / 3) / D_{iml}, \quad
+D_{iml} = \sqrt{(T_{imm} + 10^{-4})(T_{ill} + 10^{-4})}.
+```
+
+These are $`\sum_{j \ne k} R_m(r_{ij}) R_l(r_{ik}) \cos\theta_{jik}`$ and the same with
+$`\cos^2\theta_{jik} - 1/3`$, divided by D: three-body correlations of the neighbor
+directions, which a distance-only network does not see directly, near 0 where those
+directions have no order, dimensionless, and for sums T well above $`10^{-4}`$ unchanged by
+the scale of the radial channels. They need no calibration.
+
+With `orders` L above 2, each order n from 3 to L adds, for $`m \le l`$, the
+$`M(M + 1)/2`$ features
+
+```math
+\sum_{j \ne k} R_m(r_{ij}) R_l(r_{ik}) P_n(\cos\theta_{jik}) / D_{iml},
+```
+
+with $`P_n`$ the Legendre polynomial: the moments of the angle distribution that orders 1
+and 2 above do not hold. With the real harmonics $`C_n`$ of $`2n + 1`$ components,
+normalized so that $`C_n(u) \cdot C_n(v) = P_n(u \cdot v)`$, atom i sums
+$`A_{imn} = \sum_j R_m(r_{ij}) C_n(u_{ij})`$, and each feature is
+$`(A_{imn} \cdot A_{iln} - T_{iml}) / D_{iml}`$, so no triplets are formed. Only the first
+angle layer's input grows, to $`M + L M(M + 1)/2`$.
+
+The arguments are `schnet`'s, `channels`, an integer of at least 1, and `orders`,
+an integer of at least 2, whose default is the network above. Weights are drawn in
+float64 and cast to `dtype`: the SchNet part exactly as `schnet` draws it from
+`seed`, the angle layers from `seed` + 1 (matrices Xavier-uniform, biases 0). The
+state dict holds only the weights. Syncs with the host.
+
+Raises `ValueError` as `schnet` does, for `channels` that is not an integer of at
+least 1, and for `orders` that is not an integer of at least 2.
+
+### potential.sum
+
+```python
+potential.sum(*models: Potential) -> Potential
+```
+
+Build a model whose energy is the sum of the models' energies.
+
+$`E = \sum_k E_k`$ over two or more `models`, so its forces and virial are the sums of
+theirs. Its cutoff is the largest of theirs. MD and fit give each model a neighbor list
+at its own cutoff, so a short-range model beside a long-range one costs about what it
+costs alone; a list without inner lists (see `neighbors.NeighborList`) serves every
+model, at the cost of the longest. The models must share their atoms, dtype and device.
+
+The sum holds the models themselves, not copies: its parameters are theirs, named
+`parts.<k>.<name>`, k counting the models from 0. Each trains as it was built to, so
+fitting a held prior plus a trainable network fits the network to the forces the prior
+misses, and training the sum trains the models in place. A model in two sums shares its
+parameters. Convert a sum with `to` as a whole: a model converted alone no longer
+matches the others. No host sync.
+
+Raises `TypeError` for a model that is not a Potential, and `ValueError` for fewer
+than two models, or for models of other atom counts, dtypes or devices, when the sum is
+built or, after one model was converted alone, used.
 
 ### potential.tabulated
 
@@ -285,18 +431,18 @@ potential.tabulated(
 
 Build a pair potential tabulated per unordered type pair, 0 at the cutoff.
 
-E sums u(r) over the pairs closer than the cutoff, each reading the row of its two
-types. Between knots u is a C1 Catmull-Rom cubic, exact for any quadratic; below a
+E sums u(r) over the pairs closer than the cutoff $`r_c`$, each reading the row of its two
+types. Between knots u is a $`C^1`$ Catmull-Rom cubic, exact for any quadratic; below a
 row's first knot u follows its tangent. Rows end at 0 at the cutoff, so the energy is
 continuous there; the force steps to zero.
 
-`atom_types` [N], int64 in [0, T), fixes the atoms. `table` [P, K], P = T(T+1)/2 and
-K >= 4, holds u in kJ/mol at each row's knots, one row per unordered type pair in the
-order (0, 0), (0, 1), ..., (1, 1), ...; its last column, at the cutoff, must be 0. Row
-p's knots lie at start_p + k h_p, h_p = (cutoff - start_p) / (K - 1), with `start` [P]
-and `cutoff` in nm. `trainable` is ("table",) to train every row or {"table": rows}
-to train only those; no fit moves the last knot. The model computes in the dtype and on
-the device of `table`. Syncs with the host.
+`atom_types` [N], int64 in [0, T), fixes the atoms. `table` [P, K], $`P = T(T+1)/2`$
+and $`K \ge 4`$, holds u in kJ/mol at each row's knots, one row per unordered type pair in
+the order (0, 0), (0, 1), ..., (1, 1), ...; its last column, at the cutoff, must be 0. Row
+p's knots lie at $`\mathrm{start}_p + k h_p`$, $`h_p = (r_c - \mathrm{start}_p) / (K - 1)`$,
+with `start` [P] and `cutoff` in nm. `trainable` is ("table",) to train every row or
+{"table": rows} to train only those; no fit moves the last knot. The model computes in the
+dtype and on the device of `table`. Syncs with the host.
 
 Raises `ValueError` for a `trainable` that names another parameter or rows outside
 [0, P), a cutoff that is not finite and positive, a table that is not a finite float
@@ -321,7 +467,7 @@ md.maxwell_boltzmann(masses: Tensor, temperature: Real, seed: Integral) -> Tenso
 Draw velocities from the Maxwell-Boltzmann distribution at `temperature` in K.
 
 Returns velocities [N, 3] in nm/ps for `masses` [N] in Da, in their dtype and on their
-device, with zero total momentum and scaled to exactly `temperature` over 3N - 3
+device, with zero total momentum and scaled to exactly `temperature` over $`3N - 3`$
 degrees of freedom. `seed` fixes the draw on any device. Syncs with the host.
 
 Raises `ValueError` unless `masses` is a finite positive float32 or float64 vector
@@ -381,10 +527,11 @@ md.nvt(
 
 Build a simulation at constant temperature, by velocity Verlet and a Nose-Hoover chain.
 
-Takes the arguments of `nve`, plus `temperature` in K, `thermostat_timescale` tau
-in ps and, to continue a run, the `thermostat` state (float64). The 3 chain masses are
-g kT tau^2, kT tau^2 and kT tau^2, g = 3N - 3. The panel of samples (`FIELDS`, see
-`Simulation.run`) adds `conserved_energy`: U + K plus the chain's energy.
+Takes the arguments of `nve`, plus `temperature` in K, `thermostat_timescale`
+$`\tau`$ in ps and, to continue a run, the `thermostat` state (float64). The 3 chain
+masses are $`g k_B T \tau^2`$, $`k_B T \tau^2`$ and $`k_B T \tau^2`$, $`g = 3N - 3`$. The
+panel of samples (`FIELDS`, see `Simulation.run`) adds `conserved_energy`: $`U + K`$
+plus the chain's energy.
 
 Raises `ValueError` unless the temperature and the timescale are finite and positive,
 for fewer than 2 atoms or a `thermostat` that is not [3] float64 on the model's
@@ -417,13 +564,13 @@ md.npt(
 Build a simulation at constant pressure and temperature, by isotropic MTK.
 
 MTK is Martyna-Tobias-Klein dynamics. Takes the arguments of `nvt`, plus `pressure`
-in kJ/mol/nm^3 (`units.BAR` converts), `barostat_timescale` tau_b in ps and, to
+in kJ/mol/nm^3 (`units.BAR` converts), `barostat_timescale` $`\tau_b`$ in ps and, to
 continue a run, the `barostat` state. Nose-Hoover chains of 3 thermostats act on the
-particles and on the barostat; the box mass is 3 (N + 1) kT tau_b^2. The cell keeps its
-aspect ratio and scales about the origin.
+particles and on the barostat; the box mass is $`3(N + 1) k_B T \tau_b^2`$. The cell
+keeps its aspect ratio and scales about the origin.
 
 The panel of samples (`FIELDS`, see `Simulation.run`) adds `volume` in nm^3 and
-`conserved_energy`: U + K plus P V, the box's kinetic energy and both chains'
+`conserved_energy`: $`U + K`$ plus $`PV`$, the box's kinetic energy and both chains'
 energies. Started far from `pressure`, the box oscillates, as with any extended-system
 barostat.
 
@@ -439,11 +586,12 @@ class Simulation
 
 Molecular dynamics of a potential on the GPU; build it with `nve`, `nvt` or `npt`.
 
-It owns its frame, a neighbor list at the model's cutoff and a CUDA Graph of one step,
-which `run` replays. A second graph, captured on first use, evaluates the panel of
-`FIELDS`: potential, kinetic and total energy in kJ/mol, the temperature over 3N - 3
-degrees of freedom in K, and the pressure in kJ/mol/nm^3. The step reads the model's
-parameter storage, so a parameter changed in place reaches the next step.
+It owns its frame, a neighbor list at the model's cutoff, with an inner list at each
+smaller cutoff the model reads, and a CUDA Graph of one step, which `run` replays. A
+second graph, captured on first use, evaluates the panel of `FIELDS`: potential,
+kinetic and total energy in kJ/mol, the temperature over $`3N - 3`$ degrees of freedom in
+K, and the pressure in kJ/mol/nm^3. The step reads the model's parameter storage, so a
+parameter changed in place reaches the next step.
 
 #### Simulation.run
 
@@ -585,8 +733,9 @@ training.fit(
 Fit the model's trained parameters to the training labels and return a `Report`.
 
 Trained parameters are those that require gradients. A channel enters the loss when its
-weight is given (`energy`, `forces`, `virial`), as weight x mean ((X - X*) / s)^2
-with the scale s from the training labels. Each of the `updates` takes the next batch
+weight w is given (`energy`, `forces`, `virial`), as
+$`w \cdot \mathrm{mean}[((X - X^*) / s)^2]`$ with the scale s from the training
+labels. Each of the `updates` takes the next batch
 of `batch_size` frames (each epoch a new shuffle from `seed`, its last batch the
 remainder), writes the gradient of the batch's mean loss into `.grad` and calls
 `optimizer.step()`. Rows the model does not train keep their values. Parameters change
@@ -638,13 +787,15 @@ Bind (E, F, W): the energy and virial [3, 3] in kJ/mol, forces [N, 3] in kJ/mol/
 
 `energy_fn` is a model, or any energy with its call signature. The result is a
 function of `(positions, cell, pairs)`, with `pairs` from a `NeighborList`, that
-returns all three from one evaluation. F = -dE/dpositions; W = -dE/dstrain at zero
-strain, with no kinetic term, so the pressure is (2K + trace W) / (3V).
+returns all three from one evaluation. $`F = -\partial E / \partial r`$ in the positions
+r; $`W = -\partial E / \partial \varepsilon`$ in the strain $`\varepsilon`$, at zero
+strain, with no kinetic term, so the pressure is $`(2K + \mathrm{tr}(W)) / (3V)`$.
 
 ## Analysis
 
 `observables` computes instantaneous quantities of a frame: the kinetic energy, the temperature, the
-pressure and `rdf`, the radial distribution function g(r) of each type pair.
+pressure, `rdf`, the radial distribution function g(r) of each type pair, and `adf`, the
+distribution of the angles between an atom's neighbors closer than `r_max`.
 
 ### observables.rdf
 
@@ -660,18 +811,54 @@ observables.rdf(
 
 Return the radial distribution function of one frame, [C, B].
 
-A histogram over bins [r_l, r_u) with `edges` [B + 1] in nm from 0:
+A histogram over bins $`[r_l, r_u)`$ with `edges` [B + 1] in nm from 0:
 
-    g_c(b) = V n_c(b) / (P_c (4 pi / 3)(r_u^3 - r_l^3))
+```math
+g_c(b) = V n_c(b) / (P_c (4\pi/3)(r_u^3 - r_l^3))
+```
 
-where n_c(b) counts the pairs of channel c in bin b, V is the cell volume and P_c is the
-channel's number of atom pairs: N_a N_b for two types, N_a (N_a - 1) / 2 for a type with
-itself, so an ideal gas reads 1. The channels are the unordered type pairs of `types`
-[N] in the order (0, 0), (0, 1), ..., (1, 1), ..., or one channel without types.
-`positions` [N, 3] may lie outside the cell. The result has no derivative in the
-positions. Syncs with the host, to check the edges and, with `types`, to count them.
+where $`n_c(b)`$ counts the pairs of channel c in bin b, V is the cell volume and $`P_c`$
+is the channel's number of atom pairs: $`N_a N_b`$ for two types, $`N_a (N_a - 1) / 2`$
+for a type with itself, so an ideal gas reads 1. The channels are the unordered type
+pairs of `types` [N] in the order (0, 0), (0, 1), ..., (1, 1), ..., or one channel
+without types. `positions` [N, 3] may lie outside the cell. The result has no derivative
+in the positions. Syncs with the host, to check the edges and, with `types`, to count
+them.
 
-Raises `ValueError` if the last edge lies beyond the cutoff of `pairs`.
+Raises `ValueError` if the last edge lies beyond the cutoff of `pairs`, or if
+`types` does not hold one entry per atom.
+
+### observables.adf
+
+```python
+observables.adf(
+    positions: Tensor,
+    cell: Tensor,
+    pairs: NeighborPairs,
+    edges: Tensor,
+    *,
+    r_max: float,
+) -> Tensor
+```
+
+Return the angle distribution of one frame's neighbors closer than r_max, [B].
+
+For every atom i and every unordered pair of its neighbors j and k, atoms closer to i
+than `r_max` in nm by minimum image, the angle $`\theta_{jik}`$ between $`r_j - r_i`$
+and $`r_k - r_i`$, binned on `edges` [B + 1] in degrees, rising within [0, 180], each
+bin $`[l, u)`$ and the last closed; per degree:
+
+```math
+P(b) = n(b) / (n (u - l))
+```
+
+with $`n(b)`$ of the frame's n binned angles in bin b, so the distribution has unit area; a
+frame with no angle gives zeros. `positions` [N, 3] may lie outside the cell. The
+result has no derivative in the positions. With `r_max` at the g(r)'s first minimum,
+it is the first shell's angle distribution. Syncs with the host, to check `r_max` and
+to size the table of each atom's neighbors.
+
+Raises `ValueError` if `r_max` lies beyond the cutoff of `pairs`.
 
 ### observables.temperature
 
@@ -679,9 +866,9 @@ Raises `ValueError` if the last edge lies beyond the cutoff of `pairs`.
 observables.temperature(kinetic: Tensor, degrees_of_freedom: int) -> Tensor
 ```
 
-Return T = 2K / (g k_B) in K, for K in kJ/mol and g degrees of freedom.
+Return $`T = 2K / (g k_B)`$ in K, for K in kJ/mol and g degrees of freedom.
 
-With zero total momentum, g = 3N - 3.
+With zero total momentum, $`g = 3N - 3`$.
 
 ### observables.kinetic_energy
 
@@ -689,7 +876,9 @@ With zero total momentum, g = 3N - 3.
 observables.kinetic_energy(velocities: Tensor, masses: Tensor) -> Tensor
 ```
 
-Return K = sum m v^2 / 2 in kJ/mol for velocities [N, 3] in nm/ps and masses [N] in Da.
+Return the kinetic energy in kJ/mol for velocities [N, 3] in nm/ps and masses [N] in Da.
+
+$`K = \sum m v^2 / 2`$.
 
 ### observables.pressure
 
@@ -697,10 +886,11 @@ Return K = sum m v^2 / 2 in kJ/mol for velocities [N, 3] in nm/ps and masses [N]
 observables.pressure(kinetic: Tensor, virial: Tensor, cell: Tensor) -> Tensor
 ```
 
-Return the instantaneous pressure P = (2K + trace W) / (3V) in kJ/mol/nm^3.
+Return the instantaneous pressure in kJ/mol/nm^3.
 
-`kinetic` K and `virial` W [3, 3] are in kJ/mol; `cell` [3] holds the edge lengths
-in nm. Divide by `units.BAR` for bar.
+$`P = (2K + \mathrm{tr}(W)) / (3V)`$, with `kinetic` K and `virial` W [3, 3] in
+kJ/mol and V the volume of `cell` [3], its edge lengths in nm. Divide by `units.BAR`
+for bar.
 
 ## Periodic geometry
 
